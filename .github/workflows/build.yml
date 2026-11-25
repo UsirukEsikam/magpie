@@ -2,24 +2,40 @@ name: Track & Build Magpie with AGY
 
 on:
   schedule:
-    # 每天 UTC 03:00（北京时间 11:00）检查上游更新
     - cron: '0 3 * * *'
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - .github/workflows/build.yml
 
 concurrency:
   group: build-magpie-agy
   cancel-in-progress: false
 
-permissions:
-  contents: write
-  packages: write
+permissions: {}
 
 jobs:
-  build:
+  check:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      image_name: ${{ steps.check.outputs.image_name }}
+      magpie_digest: ${{ steps.check.outputs.magpie_digest }}
+      agy_version: ${{ steps.check.outputs.agy_version }}
+      source_sha: ${{ steps.check.outputs.source_sha }}
+
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
 
       - name: Check upstream versions
         id: check
@@ -27,97 +43,112 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. GHCR 镜像名强制全小写
-          IMAGE_NAME=$(printf '%s' "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
-          echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          IMAGE_NAME="ghcr.io/${GITHUB_REPOSITORY,,}"
 
-          # 2. 获取并校验上游 magpie:stable 最新 manifest digest
-          MAGPIE_DIGEST=$(docker buildx imagetools inspect ghcr.io/yetone/magpie:stable --format '{{.Manifest.Digest}}' | tr -d '\r\n')
+          MAGPIE_DIGEST=$(
+            docker buildx imagetools inspect ghcr.io/yetone/magpie:stable \
+              --format '{{.Manifest.Digest}}'
+          )
+
           if [[ ! "$MAGPIE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "::error::获取 magpie digest 失败，实际值: ${MAGPIE_DIGEST}"
+            echo "::error::Invalid Magpie digest: ${MAGPIE_DIGEST}"
             exit 1
           fi
 
-          # 3. 使用 install.sh 支持的 --dir 参数临时拉取 agy 并提取版本号
           AGY_DIR="${RUNNER_TEMP}/agy-check"
           AGY_HOME="${RUNNER_TEMP}/agy-home"
+
           mkdir -p "$AGY_DIR" "$AGY_HOME"
+
           curl -fsSL https://antigravity.google/cli/install.sh \
             | HOME="$AGY_HOME" bash -s -- --dir "$AGY_DIR"
 
-          if [ ! -x "${AGY_DIR}/agy" ]; then
-            echo "::error::未在 ${AGY_DIR} 找到可执行文件 agy"
-            ls -laR "$AGY_DIR"
-            exit 1
-          fi
-
-          # 用 awk 取首个非空行并读完 stdin，避免 set -o pipefail 下提前截断触发 SIGPIPE (141)
           AGY_VERSION=$(
             HOME="$AGY_HOME" AGY_CLI_DISABLE_AUTO_UPDATE=true \
-              "${AGY_DIR}/agy" --version 2>&1 \
-            | awk 'NF && !found { sub(/\r$/, ""); print; found=1 }'
+              "${AGY_DIR}/agy" --version 2>&1
           )
-          rm -rf "$AGY_DIR" "$AGY_HOME"
 
-          if [ -z "$AGY_VERSION" ]; then
-            echo "::error::未能解析 agy 版本号"
+          if [[ ! "$AGY_VERSION" =~ ^[0-9]+(\.[0-9]+){2}([+-][0-9A-Za-z.-]+)*$ ]]; then
+            echo "::error::Invalid agy version: ${AGY_VERSION}"
             exit 1
           fi
 
-          echo "magpie_digest=${MAGPIE_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "agy_version=${AGY_VERSION}" >> "$GITHUB_OUTPUT"
+          printf 'magpie=%s\nagy=%s\n' \
+            "$MAGPIE_DIGEST" "$AGY_VERSION" > "${RUNNER_TEMP}/versions.new"
 
-          # 4. 精确比对版本文件
-          printf "magpie=%s\nagy=%s\n" "$MAGPIE_DIGEST" "$AGY_VERSION" > "${RUNNER_TEMP}/versions.new"
+          {
+            echo "image_name=${IMAGE_NAME}"
+            echo "magpie_digest=${MAGPIE_DIGEST}"
+            echo "agy_version=${AGY_VERSION}"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
-          if [ ! -f versions.txt ] || ! cmp -s versions.txt "${RUNNER_TEMP}/versions.new" || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          cat "${RUNNER_TEMP}/versions.new"
+
+          if [ "$GITHUB_EVENT_NAME" != schedule ] \
+            || ! cmp -s versions.txt "${RUNNER_TEMP}/versions.new"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "检测到上游变更：magpie=${MAGPIE_DIGEST}, agy=${AGY_VERSION}"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "上游无更新，跳过构建。"
+            echo "Upstream versions unchanged."
           fi
 
-      - name: Set up Docker Buildx
-        if: steps.check.outputs.changed == 'true'
-        uses: docker/setup-buildx-action@v4
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
 
-      - name: Login to GHCR
-        if: steps.check.outputs.changed == 'true'
-        uses: docker/login-action@v4
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.check.outputs.source_sha }}
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        if: steps.check.outputs.changed == 'true'
         uses: docker/build-push-action@v7
         with:
           context: .
-          # 若 VPS 为 ARM64：改为 linux/arm64，并在 Buildx 前加一步 uses: docker/setup-qemu-action@v4
           platforms: linux/amd64
           push: true
           pull: true
           provenance: false
           build-args: |
-            AGY_VERSION=${{ steps.check.outputs.agy_version }}
+            MAGPIE_IMAGE=ghcr.io/yetone/magpie@${{ needs.check.outputs.magpie_digest }}
+            AGY_VERSION=${{ needs.check.outputs.agy_version }}
           tags: |
-            ${{ steps.check.outputs.image_name }}:latest
-            ${{ steps.check.outputs.image_name }}:${{ github.run_number }}
+            ${{ needs.check.outputs.image_name }}:latest
+            ${{ needs.check.outputs.image_name }}:${{ github.run_number }}
 
-      - name: Commit updated versions.txt
-        if: steps.check.outputs.changed == 'true'
+      - name: Update versions.txt
+        shell: bash
         env:
-          AGY_VERSION: ${{ steps.check.outputs.agy_version }}
+          MAGPIE_DIGEST: ${{ needs.check.outputs.magpie_digest }}
+          AGY_VERSION: ${{ needs.check.outputs.agy_version }}
         run: |
           set -euo pipefail
-          cp "${RUNNER_TEMP}/versions.new" versions.txt
+
+          printf 'magpie=%s\nagy=%s\n' \
+            "$MAGPIE_DIGEST" "$AGY_VERSION" > versions.txt
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add versions.txt
+
           if ! git diff --cached --quiet; then
             git commit -m "chore: bump upstream (agy ${AGY_VERSION})"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push origin "HEAD:${GITHUB_REF_NAME}"
+            git fetch origin main
+            git rebase FETCH_HEAD
+            git push origin HEAD:main
           fi
