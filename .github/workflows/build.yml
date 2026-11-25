@@ -28,28 +28,49 @@ jobs:
           set -euo pipefail
 
           # 1. GHCR 镜像名强制全小写
-          IMAGE_NAME=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME=$(printf '%s' "ghcr.io/${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
           echo "image_name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
 
-          # 2. 获取上游 magpie:stable 最新 manifest digest
-          MAGPIE_DIGEST=$(docker buildx imagetools inspect ghcr.io/yetone/magpie:stable --format '{{json .Manifest.Digest}}' | tr -d '"')
-          test -n "$MAGPIE_DIGEST"
+          # 2. 获取并校验上游 magpie:stable 最新 manifest digest
+          MAGPIE_DIGEST=$(docker buildx imagetools inspect ghcr.io/yetone/magpie:stable --format '{{.Manifest.Digest}}' | tr -d '\r\n')
+          if [[ ! "$MAGPIE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::获取 magpie digest 失败，实际值: ${MAGPIE_DIGEST}"
+            exit 1
+          fi
 
-          # 3. 临时拉取 agy 提取真实版本号（约 3~5 秒）
-          mkdir -p /tmp/agy-check
+          # 3. 使用 install.sh 支持的 --dir 参数临时拉取 agy 并提取版本号
+          AGY_DIR="${RUNNER_TEMP}/agy-check"
+          AGY_HOME="${RUNNER_TEMP}/agy-home"
+          mkdir -p "$AGY_DIR" "$AGY_HOME"
           curl -fsSL https://antigravity.google/cli/install.sh \
-            | HOME=/tmp/agy-check bash -s -- --skip-aliases --skip-path
-          AGY_VERSION=$(HOME=/tmp AGY_CLI_DISABLE_AUTO_UPDATE=true /tmp/agy-check/.local/bin/agy --version | head -n 1 | tr -d '\r')
-          rm -rf /tmp/agy-check
-          test -n "$AGY_VERSION"
+            | HOME="$AGY_HOME" bash -s -- --dir "$AGY_DIR"
+
+          if [ ! -x "${AGY_DIR}/agy" ]; then
+            echo "::error::未在 ${AGY_DIR} 找到可执行文件 agy"
+            ls -laR "$AGY_DIR"
+            exit 1
+          fi
+
+          # 用 awk 取首个非空行并读完 stdin，避免 set -o pipefail 下提前截断触发 SIGPIPE (141)
+          AGY_VERSION=$(
+            HOME="$AGY_HOME" AGY_CLI_DISABLE_AUTO_UPDATE=true \
+              "${AGY_DIR}/agy" --version 2>&1 \
+            | awk 'NF && !found { sub(/\r$/, ""); print; found=1 }'
+          )
+          rm -rf "$AGY_DIR" "$AGY_HOME"
+
+          if [ -z "$AGY_VERSION" ]; then
+            echo "::error::未能解析 agy 版本号"
+            exit 1
+          fi
 
           echo "magpie_digest=${MAGPIE_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "agy_version=${AGY_VERSION}" >> "$GITHUB_OUTPUT"
 
           # 4. 精确比对版本文件
-          printf "magpie=%s\nagy=%s\n" "$MAGPIE_DIGEST" "$AGY_VERSION" > /tmp/versions.new
+          printf "magpie=%s\nagy=%s\n" "$MAGPIE_DIGEST" "$AGY_VERSION" > "${RUNNER_TEMP}/versions.new"
 
-          if [ ! -f versions.txt ] || ! cmp -s versions.txt /tmp/versions.new || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ ! -f versions.txt ] || ! cmp -s versions.txt "${RUNNER_TEMP}/versions.new" || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "检测到上游变更：magpie=${MAGPIE_DIGEST}, agy=${AGY_VERSION}"
           else
@@ -90,11 +111,13 @@ jobs:
         env:
           AGY_VERSION: ${{ steps.check.outputs.agy_version }}
         run: |
-          cp /tmp/versions.new versions.txt
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/versions.new" versions.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add versions.txt
           if ! git diff --cached --quiet; then
             git commit -m "chore: bump upstream (agy ${AGY_VERSION})"
-            git push
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
